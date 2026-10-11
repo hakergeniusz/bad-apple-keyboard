@@ -227,9 +227,11 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
 
 static int kb_send_frame(struct vo *vo, const unsigned char *frame)
 {
-    struct priv *p = vo->priv;
     for (int pos = 0; pos < FRAME_SIZE; pos += CHUNK_SIZE) {
-        if (kb_query(vo, CMD_SEND_FRAME, pos, frame + pos, CHUNK_SIZE) < 0)
+        int n = FRAME_SIZE - pos;
+        if (n > CHUNK_SIZE)
+            n = CHUNK_SIZE;
+        if (kb_query(vo, CMD_SEND_FRAME, pos, frame + pos, n) < 0)
             return -1;
     }
     return 0;
