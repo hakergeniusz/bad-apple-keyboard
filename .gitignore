@@ -1,0 +1,6 @@
+data/frames.rgb
+data/cap-app.bin
+research/*.asm
+research/*.bin
+__pycache__/
+*.pyc

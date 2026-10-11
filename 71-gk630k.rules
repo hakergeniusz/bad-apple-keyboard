@@ -1,0 +1,2 @@
+# SPC Gear GK630K (Evision 3299:4E5A) - user read/write on the RGB hidraw node
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3299", ATTRS{idProduct}=="4e5a", MODE="0660", GROUP="users", TAG+="uaccess"
