@@ -50,11 +50,14 @@
 struct vo_rgb_keyboard_opts {
     char *device;   // hidraw path, empty = auto-detect
     int max_fps;    // stream at most this many frames per second
+    double brightness; // 0.0-1.0 global brightness scale
 };
 
 struct priv {
     struct vo_rgb_keyboard_opts opts;
     int fd;
+    char path[256];
+    int fails;
     int64_t last_frame_us;
     int swidth;
     int sheight;
@@ -114,6 +117,42 @@ static void kb_drain(struct priv *p)
 }
 
 // Send one vendor command packet, wait for the echo reply. Returns 0 on success.
+static int kb_open(struct vo *vo, const char *path)
+{
+    struct priv *p = vo->priv;
+    int fd = open(path, O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        MP_ERR(vo, "cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    p->fd = fd;
+    p->fails = 0;
+    return 0;
+}
+
+// Reopen after a stall/reset (firmware bootloops recycle the hidraw node).
+static int kb_reopen(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+    // node may briefly vanish during re-enumeration; retry a few times
+    for (int i = 0; i < 20; i++) {
+        if (kb_open(vo, p->path) == 0) {
+            MP_WARN(vo, "reopened %s after error\n", p->path);
+            // stale node? re-detect by VID/PID
+            return 0;
+        }
+        if (find_hidraw(p->path, sizeof(p->path)) == 0)
+            continue;
+        usleep(200000);
+    }
+    MP_ERR(vo, "keyboard gone, giving up\n");
+    return -1;
+}
+
 static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
                     const unsigned char *data, int size)
 {
@@ -132,33 +171,58 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
     pkt[1] = ck & 0xFF;
     pkt[2] = (ck >> 8) & 0xFF;
 
-    kb_drain(p);
-    if (write(p->fd, pkt, sizeof(pkt)) != sizeof(pkt)) {
-        MP_ERR(vo, "hidraw write failed: %s\n", strerror(errno));
-        return -1;
-    }
-    int64_t deadline = mp_time_ns() / 1000 + 150000;
-    for (;;) {
-        int64_t now = mp_time_ns() / 1000;
-        if (now >= deadline) {
-            MP_ERR(vo, "no reply to command 0x%02x\n", cmd);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (p->fd < 0 && kb_reopen(vo) < 0)
             return -1;
-        }
-        fd_set rfds;
-        struct timeval tv;
-        int64_t usec = deadline - now;
-        tv.tv_sec = usec / 1000000;
-        tv.tv_usec = usec % 1000000;
-        FD_ZERO(&rfds);
-        FD_SET(p->fd, &rfds);
-        if (select(p->fd + 1, &rfds, NULL, NULL, &tv) <= 0)
+        kb_drain(p);
+        if (write(p->fd, pkt, sizeof(pkt)) != sizeof(pkt)) {
+            MP_DBG(vo, "hidraw write failed: %s\n", strerror(errno));
+            close(p->fd);
+            p->fd = -1;
             continue;
-        unsigned char resp[PACKET_SIZE];
-        ssize_t n = read(p->fd, resp, sizeof(resp));
-        if (n == sizeof(resp) && resp[0] == REPORT_ID && resp[3] == cmd &&
-            (resp[5] | (resp[6] << 8)) == offset)
-            return 0;
+        }
+        int64_t deadline = mp_time_ns() / 1000 + 150000;
+        for (;;) {
+            int64_t now = mp_time_ns() / 1000;
+            if (now >= deadline)
+                break;
+            fd_set rfds;
+            struct timeval tv;
+            int64_t usec = deadline - now;
+            tv.tv_sec = usec / 1000000;
+            tv.tv_usec = usec % 1000000;
+            FD_ZERO(&rfds);
+            FD_SET(p->fd, &rfds);
+            int r = select(p->fd + 1, &rfds, NULL, NULL, &tv);
+            if (r < 0) {
+                close(p->fd);
+                p->fd = -1;
+                break;
+            }
+            if (r == 0)
+                continue;
+            unsigned char resp[PACKET_SIZE];
+            ssize_t n = read(p->fd, resp, sizeof(resp));
+            if (n < 0) {
+                close(p->fd);
+                p->fd = -1;
+                break;
+            }
+            if (n == sizeof(resp) && resp[0] == REPORT_ID && resp[3] == cmd &&
+                (resp[5] | (resp[6] << 8)) == offset) {
+                p->fails = 0;
+                return 0;
+            }
+        }
+        // timeout: drop stale fd, retry once via reopen
+        if (p->fd >= 0) {
+            close(p->fd);
+            p->fd = -1;
+        }
     }
+    if (++p->fails == 1 || p->fails % 30 == 0)
+        MP_WARN(vo, "no reply to command 0x%02x (keyboard resetting?)\n", cmd);
+    return -1;
 }
 
 static int kb_send_frame(struct vo *vo, const unsigned char *frame)
@@ -171,9 +235,14 @@ static int kb_send_frame(struct vo *vo, const unsigned char *frame)
     return 0;
 }
 
-static void sample_frame(const unsigned char *src, int stride, unsigned char *out)
+static void sample_frame(const unsigned char *src, int stride, unsigned char *out,
+                         double brightness)
 {
     memset(out, 0, FRAME_SIZE);
+    if (brightness < 0)
+        brightness = 0;
+    if (brightness > 1)
+        brightness = 1;
     for (int i = 0; i < RGBKB_NUM_KEYS; i++) {
         int s = rgbkb_keys[i].slot;
         long r = 0, g = 0, b = 0, n = 0;
@@ -187,9 +256,9 @@ static void sample_frame(const unsigned char *src, int stride, unsigned char *ou
             }
         }
         if (n) {
-            out[s * 3 + 0] = r / n;
-            out[s * 3 + 1] = g / n;
-            out[s * 3 + 2] = b / n;
+            out[s * 3 + 0] = (r / n) * brightness;
+            out[s * 3 + 1] = (g / n) * brightness;
+            out[s * 3 + 2] = (b / n) * brightness;
         }
     }
 }
@@ -236,7 +305,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_sws_scale(p->sws, p->frame, src);
 
     unsigned char rgb[FRAME_SIZE];
-    sample_frame(p->frame->planes[0], p->frame->stride[0], rgb);
+    sample_frame(p->frame->planes[0], p->frame->stride[0], rgb,
+                 p->opts.brightness);
     if (kb_send_frame(vo, rgb) == 0)
         p->last_frame_us = now;
     return VO_TRUE;
@@ -274,13 +344,12 @@ static int preinit(struct vo *vo)
                  VID, PID);
         return -1;
     }
-    p->fd = open(path, O_RDWR | O_NONBLOCK);
-    if (p->fd < 0) {
-        MP_FATAL(vo, "cannot open %s: %s (udev rule / permissions?)\n",
-                 path, strerror(errno));
+    snprintf(p->path, sizeof(p->path), "%s", path);
+    if (kb_open(vo, p->path) < 0) {
+        MP_FATAL(vo, "cannot open %s (udev rule / permissions?)\n", p->path);
         return -1;
     }
-    MP_INFO(vo, "streaming to %s\n", path);
+    MP_INFO(vo, "streaming to %s\n", p->path);
 
     p->sws = mp_sws_alloc(vo);
     p->sws->log = vo->log;
@@ -315,10 +384,12 @@ const struct vo_driver video_out_rgb_keyboard = {
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const struct priv) {
         .opts.max_fps = 30,
+        .opts.brightness = 1.0,
     },
     .options = (const m_option_t[]) {
         {"device", OPT_STRING(opts.device)},
         {"max-fps", OPT_INT(opts.max_fps)},
+        {"brightness", OPT_DOUBLE(opts.brightness)},
         {0}
     },
     .options_prefix = "vo-rgb-keyboard",
