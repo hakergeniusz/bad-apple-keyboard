@@ -1,5 +1,7 @@
 # bad-apple-keyboard
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Play video on an **SPC Gear GK630K** keyboard's per-key RGB — including a
 custom **`--vo=rgb-keyboard` video output for mpv**. No Windows software needed.
 
