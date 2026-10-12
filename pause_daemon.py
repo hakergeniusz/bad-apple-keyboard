@@ -131,11 +131,7 @@ def main():
                             print('PAUSE: playing 56s', flush=True)
                             mode, fidx, t0, ripples = 'play', 0, time.monotonic(), []
                             break
-                        if now - last_trig.get(code, -9) < 0.08:
-                            continue  # dup from 2nd interface
-                        last_trig[code] = now
-                        for pos in CODE_POS.get(code, []):
-                            ripples.append((pos[0], pos[1], now))
+                        pass  # plain white idle: ignore all keys except PAUSE
                 if mode == 'idle':
                     kb.send_frame(render_idle(ripples, time.monotonic()))
             else:
