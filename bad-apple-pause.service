@@ -1,0 +1,12 @@
+[Unit]
+Description=GK630K Pause key -> 56s Bad Apple
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/uv run --no-project --with numpy python /home/hakergeniusz/projects/bad-apple-keyboard/pause_daemon.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
