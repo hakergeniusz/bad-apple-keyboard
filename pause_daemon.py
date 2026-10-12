@@ -15,7 +15,7 @@ KEY_PAUSE, EV_KEY = 119, 1
 EVT = struct.Struct('qqHHI')
 
 BRIGHTNESS = 1.0          # white idle level, 0.0-1.0
-RIPPLE_COLOR = (0xD6, 0x8C, 0xE6)
+RIPPLE_COLOR = (0x08, 0x2D, 0x8A)
 RIPPLE_BRIGHTNESS = 0.8   # ripple intensity, 0.0-1.0
 RIPPLE_SPEED = 7.0        # keys per second
 RIPPLE_DECAY = 0.9        # seconds
