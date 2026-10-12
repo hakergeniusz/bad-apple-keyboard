@@ -40,5 +40,6 @@ Scripts hardcode absolute paths under `BASE` — keep them consistent if moved.
 
 ## Completion
 Report the changed files and checks run. End every session with the owner's
-lighting restored (or the daemon running, which holds plain white) and the
-working tree committed + pushed.
+lighting restored and the working tree committed + pushed.
+(Note: the idle daemon is currently disabled — it fought the mpv VO over
+the hidraw node. Re-enable only if VO use is paused.)
