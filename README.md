@@ -35,6 +35,10 @@ thanks to [hivectl](https://github.com/omsingh02/hivectl) for documenting it).
   into per-key `badapple.kbd` frames.
 - `mpv-vo/vo_rgb_keyboard.c` — mpv video output: `mpv --vo=rgb-keyboard file`
   (`+vo_rgb_keyboard_map.h`, generated sampling rects).
+- `mpv-vo/0001-vo-rgb-keyboard-integration.patch` — hooks the driver into
+  mpv's build (meson.build + video/out/vo.c).
+- `tools/build_mpv.sh` — builds mpv with the driver and writes `./mpv-bin`.
+- `mpv-bin` — prebuilt mpv v0.41.0 with `--vo=rgb-keyboard`.
 - `tools/` — RE notes: usbmon capture parser, descriptors, probes.
 - `71-gk630k.rules` — udev rule so hidraw is user-writable.
 
@@ -47,15 +51,41 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 
 ## mpv VO build
 
+`mpv-bin` is a prebuilt mpv v0.41.0 with the `rgb-keyboard` video output.
+Rebuild it from this repo (patches a clean mpv checkout):
+
 ```sh
-git clone https://github.com/mpv-player/mpv.git
-cp mpv-vo/vo_rgb_keyboard.c mpv-vo/vo_rgb_keyboard_map.h mpv/video/out/
-# register in mpv/meson.build sources + video/out/vo.c driver list
-meson setup mpv/build --prefix=$HOME/.local
-ninja -C mpv/build && ninja -C mpv/build install
-mpv --vo=rgb-keyboard bad_apple.mkv        # audio + keys
-mpv --vo=rgb-keyboard=max-fps=60 bad_apple.mkv
+./tools/build_mpv.sh          # -> ./mpv-bin
 ```
+
+Needs `meson`, `ninja`, a C compiler and mpv's build deps (ffmpeg,
+libplacebo, …).  The mpv checkout lives in `~/.cache/ai-agent/mpv-src`
+(override with `MPV_SRC=...`); the script clones mpv v0.41.0 if missing,
+resets the tree, copies `mpv-vo/vo_rgb_keyboard.{c,map.h}` into
+`video/out/`, applies the integration patch and rebuilds.
+
+Usage:
+
+```sh
+./mpv-bin --vo=rgb-keyboard bad_apple.mkv                    # audio + keys
+./mpv-bin --vo=rgb-keyboard --vo-rgb-keyboard-max-fps=60 bad_apple.mkv
+./mpv-bin --vo=rgb-keyboard --vo-rgb-keyboard-brightness=0.6 bad_apple.mkv
+./mpv-bin --vo=rgb-keyboard --vo-rgb-keyboard-device=/dev/hidraw1 bad_apple.mkv
+```
+
+Note: mpv removed `--vo=driver=opt=value` sub-options in 0.23, so driver
+options are passed as separate global options named `--vo-<driver>-<option>`.
+`--vo=rgb-keyboard=max-fps=60` is an *error*, not a shortcut.
+
+The driver streams frames to RAM only (command `0x12`), so the stored
+lighting profile is never touched.  On SIGINT/SIGTERM it sends the
+end-of-frame command (`0x13`) from a signal handler, so the keyboard never
+stays stuck in frame-streaming mode.
+
+Throughput is limited by the USB round trips, not by mpv: every frame is 7
+request/reply packets (56 B each, the last one 48 B), which caps the board
+at ~25 fps (`--vo-rgb-keyboard-max-fps=60`); the default 30 fps cap yields
+~15 fps.  Measure with `tools/bench_fps.sh`.
 
 ## Bad Apple
 

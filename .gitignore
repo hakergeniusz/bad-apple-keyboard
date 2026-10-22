@@ -4,3 +4,4 @@ research/*.asm
 research/*.bin
 __pycache__/
 *.pyc
+mpv-bin

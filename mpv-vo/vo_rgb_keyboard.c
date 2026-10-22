@@ -15,6 +15,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/select.h>
@@ -65,6 +66,132 @@ struct priv {
     struct mp_sws_context *sws;
 };
 
+// The firmware stays in RGB frame-streaming mode until it receives
+// CMD_END_FRAME.  If mpv is killed with SIGKILL (or crashes) the normal
+// uninit() path never runs, and the keyboard is left streaming - which
+// wedges its firmware key state (the host then sees a phantom key repeating
+// forever).  A signal handler cannot do the full write/read handshake
+// safely, so it only writes the 64-byte END_FRAME packet asynchronously;
+// the kernel guarantees the write is delivered.
+//
+// mpv installs its own SIGINT/SIGTERM/SIGQUIT handlers (terminal-unix.c) to
+// request a graceful shutdown, so we chain to the previous handler instead of
+// replacing it - otherwise mpv would never exit.  mpv only installs them
+// when it owns the terminal (terminal_setup_getch), so the previous
+// disposition can also be SIG_DFL: in that case we must re-raise the signal
+// with the default action, otherwise the signal would be swallowed and mpv
+// would keep running.
+//
+// The END_FRAME packet is a constant (checksum = sum of bytes 3..63 = 0x13),
+// so the handler only has to write() it - fully async-signal-safe.
+static volatile sig_atomic_t kb_endframe_fd = -1;
+
+static const unsigned char kb_endframe_pkt[PACKET_SIZE] = {
+    REPORT_ID, 0x13, 0x00, CMD_END_FRAME, 0x00, 0x00, 0x00, 0x00,
+};
+
+static struct sigaction kb_prev_sa[4];
+static int kb_prev_sa_valid = 0;
+static const int kb_sig_nums[4] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+
+// Restore the default disposition and re-raise, so the process dies exactly
+// as it would have without our handler installed.
+static void kb_sig_default_action(int sig)
+{
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+
+static void kb_sig_end_frame(int sig)
+{
+    int fd = (int)kb_endframe_fd;
+    if (fd >= 0) {
+        ssize_t r = write(fd, kb_endframe_pkt, sizeof(kb_endframe_pkt));
+        (void)r;
+    }
+    // Chain to whatever mpv had installed before us.
+    if (!kb_prev_sa_valid)
+        return;
+    for (int i = 0; i < 4; i++) {
+        if (kb_sig_nums[i] != sig)
+            continue;
+        const struct sigaction *prev = &kb_prev_sa[i];
+        if (prev->sa_flags & SA_SIGINFO) {
+            if (prev->sa_sigaction &&
+                prev->sa_sigaction !=
+                    (void (*)(int, siginfo_t *, void *))kb_sig_end_frame)
+                prev->sa_sigaction(sig, NULL, NULL);
+            else if (!prev->sa_sigaction)
+                kb_sig_default_action(sig);
+        } else if (prev->sa_handler == (void (*)(int))kb_sig_end_frame) {
+            // We captured our own handler (VO re-created): do not recurse.
+            kb_sig_default_action(sig);
+        } else if (prev->sa_handler == SIG_IGN) {
+            // Explicitly ignored before us: keep ignoring it.
+        } else if (!prev->sa_handler || prev->sa_handler == SIG_DFL) {
+            kb_sig_default_action(sig);
+        } else {
+            prev->sa_handler(sig);
+        }
+        return;
+    }
+}
+
+// Install our handler, remembering the previous disposition.  Only the first
+// installation may capture the previous actions - a second preinit() would
+// otherwise capture our own handler and recurse forever.
+static void kb_install_signal_handlers(struct vo *vo)
+{
+    if (kb_prev_sa_valid)
+        return;
+    for (int i = 0; i < 4; i++) {
+        struct sigaction sa;
+        sa.sa_handler = kb_sig_end_frame;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(kb_sig_nums[i], &sa, &kb_prev_sa[i]);
+        MP_VERBOSE(vo, "signal %d: previous handler %s\n", kb_sig_nums[i],
+                   kb_prev_sa[i].sa_handler == SIG_DFL ? "SIG_DFL" :
+                   kb_prev_sa[i].sa_handler == SIG_IGN ? "SIG_IGN" : "custom");
+    }
+    kb_prev_sa_valid = 1;
+}
+
+// Put back the dispositions we replaced (only if they are still ours).
+static void kb_restore_signal_handlers(void)
+{
+    if (!kb_prev_sa_valid)
+        return;
+    for (int i = 0; i < 4; i++) {
+        struct sigaction cur;
+        if (sigaction(kb_sig_nums[i], NULL, &cur) == 0 &&
+            !(cur.sa_flags & SA_SIGINFO) &&
+            cur.sa_handler == (void (*)(int))kb_sig_end_frame)
+            sigaction(kb_sig_nums[i], &kb_prev_sa[i], NULL);
+    }
+    kb_prev_sa_valid = 0;
+}
+
+// HID_PHYS looks like "usb-0000:00:14.0-5/input1"; return the input index
+// (the trailing number), or -1 if there is none.
+static int phys_input_index(const char *phys)
+{
+    const char *p = strstr(phys, "/input");
+    if (!p)
+        return -1;
+    p += 6;
+    if (*p < '0' || *p > '9')
+        return -1;
+    int n = 0;
+    while (*p >= '0' && *p <= '9')
+        n = n * 10 + (*p++ - '0');
+    return n;
+}
+
 static int find_hidraw(char *out, size_t outlen)
 {
     DIR *d = opendir("/sys/class/hidraw");
@@ -75,9 +202,10 @@ static int find_hidraw(char *out, size_t outlen)
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.')
             continue;
-        char path[256], phys[256] = "", id[256] = "";
+        char path[512], phys[256] = "", id[256] = "";
         FILE *f;
-        snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", e->d_name);
+        snprintf(path, sizeof(path), "/sys/class/hidraw/%.128s/device/uevent",
+                 e->d_name);
         f = fopen(path, "r");
         if (!f)
             continue;
@@ -91,8 +219,9 @@ static int find_hidraw(char *out, size_t outlen)
         fclose(f);
         unsigned int bus, vid, pid;
         if (sscanf(id, "%x:%x:%x", &bus, &vid, &pid) == 3 &&
-            vid == VID && pid == PID && strstr(phys, "input1")) {
-            snprintf(out, outlen, "/dev/%s", e->d_name);
+            vid == VID && pid == PID && phys_input_index(phys) == 1) {
+            snprintf(out, outlen, "/dev/%.*s",
+                     (int)(outlen > 6 ? outlen - 6 : 0), e->d_name);
             found = 0;
             break;
         }
@@ -127,6 +256,7 @@ static int kb_open(struct vo *vo, const char *path)
     }
     p->fd = fd;
     p->fails = 0;
+    kb_endframe_fd = fd;
     return 0;
 }
 
@@ -137,6 +267,7 @@ static int kb_reopen(struct vo *vo)
     if (p->fd >= 0) {
         close(p->fd);
         p->fd = -1;
+        kb_endframe_fd = -1;
     }
     // node may briefly vanish during re-enumeration; retry a few times
     for (int i = 0; i < 20; i++) {
@@ -179,6 +310,7 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
             MP_DBG(vo, "hidraw write failed: %s\n", strerror(errno));
             close(p->fd);
             p->fd = -1;
+            kb_endframe_fd = -1;
             continue;
         }
         int64_t deadline = mp_time_ns() / 1000 + 150000;
@@ -197,6 +329,7 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
             if (r < 0) {
                 close(p->fd);
                 p->fd = -1;
+                kb_endframe_fd = -1;
                 break;
             }
             if (r == 0)
@@ -206,6 +339,7 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
             if (n < 0) {
                 close(p->fd);
                 p->fd = -1;
+                kb_endframe_fd = -1;
                 break;
             }
             if (n == sizeof(resp) && resp[0] == REPORT_ID && resp[3] == cmd &&
@@ -218,6 +352,7 @@ static int kb_query(struct vo *vo, uint8_t cmd, uint16_t offset,
         if (p->fd >= 0) {
             close(p->fd);
             p->fd = -1;
+            kb_endframe_fd = -1;
         }
     }
     if (++p->fails == 1 || p->fails % 30 == 0)
@@ -322,11 +457,13 @@ static void flip_page(struct vo *vo)
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    kb_restore_signal_handlers();
     if (p->fd >= 0) {
         kb_query(vo, CMD_END_FRAME, 0, NULL, 0);
         close(p->fd);
         p->fd = -1;
     }
+    kb_endframe_fd = -1;
     talloc_free(p->frame);
     p->frame = NULL;
 }
@@ -342,7 +479,8 @@ static int preinit(struct vo *vo)
         snprintf(path, sizeof(path), "%s", p->opts.device);
     } else if (find_hidraw(path, sizeof(path)) < 0) {
         MP_FATAL(vo, "GK630K keyboard not found (USB %04x:%04x). "
-                 "Is it plugged in by cable? See --vo=rgb-keyboard=device=...\n",
+                 "Is it plugged in by cable? "
+                 "See --vo-rgb-keyboard-device=/dev/hidrawN\n",
                  VID, PID);
         return -1;
     }
@@ -352,6 +490,11 @@ static int preinit(struct vo *vo)
         return -1;
     }
     MP_INFO(vo, "streaming to %s\n", p->path);
+
+    // Make sure the keyboard leaves RGB streaming mode even if mpv is
+    // killed with SIGINT/SIGTERM (see kb_sig_end_frame).  We chain to
+    // mpv's own handlers so graceful shutdown still works.
+    kb_install_signal_handlers(vo);
 
     p->sws = mp_sws_alloc(vo);
     p->sws->log = vo->log;

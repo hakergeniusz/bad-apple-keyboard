@@ -35,8 +35,11 @@ Scripts hardcode absolute paths under `BASE` — keep them consistent if moved.
 - Frame pipeline: `tools/make_frames.py` reads `data/frames.rgb`, writes
   `data/badapple.kbd`. Do not commit new large captures (`data/*.bin`,
   `*.asm` are gitignored for a reason).
-- mpv VO: sources live in `mpv-vo/`; build/register steps are in README.md
-  ("mpv VO build"). After editing the driver, copy it back to `mpv-vo/`.
+- mpv VO: the driver source is `mpv-vo/vo_rgb_keyboard.c` (+ `vo_rgb_keyboard_map.h`).
+  The mpv build integration is `mpv-vo/0001-vo-rgb-keyboard-integration.patch`.
+  `tools/build_mpv.sh` copies the driver into the mpv checkout, applies the
+  patch, rebuilds and writes `./mpv-bin`.  Edit the driver in `mpv-vo/`, then
+  rebuild — do not edit the mpv checkout directly, the script resets it.
 
 ## Completion
 Report the changed files and checks run. End every session with the owner's
