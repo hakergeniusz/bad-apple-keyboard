@@ -44,9 +44,34 @@ thanks to [hivectl](https://github.com/omsingh02/hivectl) for documenting it).
 
 ## udev
 
-```
+```sh
 sudo cp 71-gk630k.rules /etc/udev/rules.d/
+sudo install -m 0644 71-gk630k.hwdb /etc/udev/hwdb.d/
+sudo systemd-hwdb update
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+```
+
+The **hwdb** part is not optional.  The GK630K firmware echoes every key
+press as consumer-page usages (`0x0C05xx` press / `0x0C06xx` release) and
+never sends `value 0`, so the key never releases and the input layer wedges
+permanently.  Symptom: the **Super key stops working at the GNOME level**
+(the overview never opens) while the focused *app* still receives the
+keypress - because mutter consumes the key only when it recognises it, and
+the bogus events break its press/release pairing.  The hwdb maps those 512
+usages to `reserved`; libinput picks the mapping up from the device's udev
+properties (`KEYBOARD_KEY_*`), so the compositor never sees them.
+
+After installing the hwdb, replug the keyboard - the mapping is read when
+the HID driver probes the device.  Without a replug you can rebind the
+driver instead:
+
+```sh
+for d in 0003:3299:4E5A.0006 0003:3299:4E5A.0005; do
+    echo $d | sudo tee /sys/bus/hid/drivers/hid-generic/unbind
+done
+for d in 0003:3299:4E5A.0005 0003:3299:4E5A.0006; do
+    echo $d | sudo tee /sys/bus/hid/drivers/hid-generic/bind
+done
 ```
 
 ## mpv VO build
